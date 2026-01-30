@@ -1,10 +1,10 @@
 <?php
 /**
- * Plugin Name: Transporte Pago en Destino
+ * Plugin Name: Mobapp Transporte Multiopciones 
  * Description: Método de envío para WooCommerce que permite al cliente elegir su transporte preferido
  * Version: 1.0.0
- * Author: Tu Nombre
- * Text Domain: transporte-pago-destino
+ * Author: Mobapp
+ * Text Domain: mobapp-transporte-multiopciones
  * Requires Plugins: woocommerce
  */
 
