@@ -1,456 +1,729 @@
 <?php
-/**
- * Plugin Name: Mobapp Transporte Multiopciones 
- * Description: Método de envío para WooCommerce que permite al cliente elegir su transporte preferido
- * Version: 1.0.0
- * Author: Mobapp
- * Text Domain: mobapp-transporte-multiopciones
- * Requires Plugins: woocommerce
- */
+/*
+Plugin Name: Mobapp Transportes Personalizados
+Description: Método de envío para WooCommerce con selección de transportista o personalizado. Guarda la selección por instancia (AJAX + sesión + dedupe), muestra solo el desplegable del método seleccionado y ocupa todo el ancho. Todo ejecutado desde el plugin.
+Version: 2.9
+Author: Mobapp Express
+License: GPL2
+Domain Path: /languages
+*/
 
-if (!defined('ABSPATH')) {
+if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-// Inicializar el plugin después de que WooCommerce cargue
-add_action('woocommerce_shipping_init', 'transporte_pago_destino_init');
+/**
+ * Enqueue scripts + styles (cart & checkout)
+ * Includes:
+ * - JS: debounce + AJAX save + visibility behavior (show selects only for selected radio)
+ * - CSS: place selectors below radio and full-width
+ */
+add_action( 'wp_enqueue_scripts', 'mobapp_enqueue_scripts' );
+function mobapp_enqueue_scripts() {
+    if ( ! ( is_cart() || is_checkout() ) ) {
+        return;
+    }
 
-function transporte_pago_destino_init() {
-    
-    class WC_Shipping_Transporte_Pago_Destino extends WC_Shipping_Method {
-        
-        public function __construct($instance_id = 0) {
-            $this->id = 'transporte_pago_destino';
-            $this->instance_id = absint($instance_id);
-            $this->method_title = __('Transporte Pago en Destino', 'transporte-pago-destino');
-            $this->method_description = __('Permite al cliente elegir el transporte de su preferencia', 'transporte-pago-destino');
-            $this->supports = array(
-                'shipping-zones',
-                'instance-settings',
-                'instance-settings-modal',
-            );
-            
+    // Register a no-file script handle and enqueue inline JS
+    wp_register_script( 'mobapp-transportes', false, array( 'jquery' ), '2.9', true );
+    wp_enqueue_script( 'mobapp-transportes' );
+
+    // Localize for AJAX
+    wp_localize_script( 'mobapp-transportes', 'mobappTransportes', array(
+        'ajax_url' => admin_url( 'admin-ajax.php' ),
+        'nonce'    => wp_create_nonce( 'mobapp-save-carrier' ),
+    ) );
+
+    // Inline JS: save logic (debounce + dedupe), and visibility UI behavior
+    $js = <<<'JS'
+(function($){
+    var MobappState = {};
+    function ensureState(iid) {
+        if (!MobappState[iid]) MobappState[iid] = { timer: null, lastPayload: null, inFlight: false };
+        return MobappState[iid];
+    }
+    function payloadHash(iid, carrier, custom) { return iid + '|' + carrier + '|' + custom; }
+    function sendSave(iid, carrier, custom) {
+        var state = ensureState(iid);
+        var hash = payloadHash(iid, carrier, custom);
+
+        // Don't send if there's nothing useful to save
+        if ((carrier === '' || typeof carrier === 'undefined') && (custom === '' || typeof custom === 'undefined')) {
+            return;
+        }
+
+        // Avoid resending identical payload
+        if (state.lastPayload === hash && !state.inFlight) return;
+        if (state.inFlight && state.lastPayload === hash) return;
+
+        state.inFlight = true;
+        state.lastPayload = hash;
+
+        $.post(mobappTransportes.ajax_url, {
+            action: 'mobapp_save_carrier',
+            nonce: mobappTransportes.nonce,
+            instance_id: iid,
+            carrier: carrier,
+            custom: custom
+        }, function(response){
+            // optional: handle response
+        }, 'json').always(function(){
+            state.inFlight = false;
+        });
+    }
+    function scheduleSave(iid, carrier, custom) {
+        var state = ensureState(iid);
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = setTimeout(function(){
+            sendSave(iid, carrier, custom);
+            state.timer = null;
+        }, 300);
+    }
+
+    // When select changes: attempt to save (sendSave will skip empties)
+    $(document).on('change', '.mobapp-carrier-select', function(){
+        var $container = $(this).closest('.mobapp-carrier-selector');
+        var iid = $container.data('instance');
+        var val = $(this).val() || '';
+        var custom = $container.find('.mobapp-custom-carrier').val() || '';
+        if (val === 'custom') $container.find('.mobapp-custom-carrier').show(); else $container.find('.mobapp-custom-carrier').hide();
+        scheduleSave(iid, val, custom);
+    });
+
+    // When custom input changes: debounced save
+    $(document).on('input', '.mobapp-custom-carrier', function(){
+        var $container = $(this).closest('.mobapp-carrier-selector');
+        var iid = $container.data('instance');
+        var val = $container.find('select.mobapp-carrier-select').val() || '';
+        var custom = $(this).val() || '';
+        scheduleSave(iid, val, custom);
+    });
+
+    // UI: show selectors only for the currently selected shipping radio (and hide others).
+    function updateSelectorsVisibility() {
+        $('.mobapp-carrier-selector').hide(); // hide all by default
+        // For each checked shipping radio, show the matched selector
+        $('input[type=radio][name^="shipping_method"]:checked').each(function(){
+            var val = $(this).val() || '';
+            var m = val.match(/:([0-9]+)$/);
+            if ( m && m[1] ) {
+                var iid = m[1];
+                $('.mobapp-carrier-selector[data-instance="' + iid + '"]').show();
+            }
+        });
+    }
+
+    // When shipping method radio changes, schedule showing of the associated selector (if it has value)
+    $(document).on('change', 'input[name^="shipping_method"], input[name="shipping_method[0]"], input[name="shipping_method"]', function(){
+        // Allow WooCommerce to update rates first, then update visibility
+        setTimeout(function(){
+            updateSelectorsVisibility();
+            // Additionally, only schedule a save if selected selector has a non-empty value
+            $('.mobapp-carrier-selector').each(function(){
+                var $container = $(this);
+                var iid = $container.data('instance');
+                if (!iid) return;
+                var selector = 'input[type=radio][name^="shipping_method"][value*=":' + iid + '"]';
+                var isChecked = $(selector).filter(':checked').length > 0;
+                if (!isChecked) return;
+                var val = $container.find('select.mobapp-carrier-select').val() || '';
+                var custom = $container.find('.mobapp-custom-carrier').val() || '';
+                if ( val !== '' || custom !== '' ) {
+                    scheduleSave(iid, val, custom);
+                }
+            });
+        }, 60);
+    });
+
+    // Also respond to WC AJAX updates (rates re-render)
+    $(document.body).on('updated_shipping_method updated_checkout updated_shipping_method', function() {
+        setTimeout(updateSelectorsVisibility, 80);
+    });
+
+    // Initialize on DOM ready
+    $(function(){
+        updateSelectorsVisibility();
+    });
+})(jQuery);
+JS;
+
+    wp_add_inline_script( 'mobapp-transportes', $js );
+
+    // Register and enqueue a dummy style handle, then add inline CSS to control layout/visibility
+    wp_register_style( 'mobapp-transportes-style', false );
+    wp_enqueue_style( 'mobapp-transportes-style' );
+
+    $css = <<<'CSS'
+/* Ensure selector is hidden by default and placed below radio; full width */
+.mobapp-carrier-selector {
+  display: none;
+  width: 100% !important;
+  box-sizing: border-box;
+  clear: both;
+  margin-top: 6px;
+}
+
+/* Full width select and input */
+.mobapp-carrier-selector .mobapp-carrier-select,
+.mobapp-carrier-selector .mobapp-custom-carrier {
+  display: block !important;
+  width: 100% !important;
+  max-width: none !important;
+  box-sizing: border-box;
+  margin: 0;
+  padding: .45em;
+}
+
+/* Force the selector to sit below the shipping label/radio */
+li.shipping_method .mobapp-carrier-selector,
+.woocommerce-shipping-methods .mobapp-carrier-selector {
+  float: none !important;
+  position: relative !important;
+}
+
+/* Optional: small indent to align with label text (adjust if needed) */
+.woocommerce-shipping-methods li .mobapp-carrier-selector {
+  margin-left: 0;
+}
+
+/* Mobile tweaks */
+@media (max-width: 768px) {
+  .mobapp-carrier-selector { margin-top: 10px; }
+}
+CSS;
+
+    wp_add_inline_style( 'mobapp-transportes-style', $css );
+}
+
+/* --------------------------------------------------------------------
+ * Shipping method class (instance-based)
+ * -------------------------------------------------------------------- */
+add_action( 'woocommerce_shipping_init', function() {
+    if ( class_exists( 'Mobapp_Envio_Personalizado' ) ) {
+        return;
+    }
+
+    class Mobapp_Envio_Personalizado extends WC_Shipping_Method {
+
+        public $cost;
+        public $free_shipping;
+        public $carriers;
+        public $allow_custom_carrier;
+        public $carrier_field;
+
+        public function __construct( $instance_id = 0 ) {
+            $this->id = 'mobapp_envio_personalizado';
+            $this->instance_id = absint( $instance_id );
+            $this->method_title = 'Envío Personalizado';
+            $this->method_description = 'Elige entre varios transportistas o añade uno nuevo';
+            $this->supports = array( 'shipping-zones', 'instance-settings', 'instance-settings-modal' );
             $this->init();
         }
-        
+
         public function init() {
             $this->init_form_fields();
             $this->init_settings();
-            
-            $this->title = $this->get_option('title', __('Transporte Pago en Destino', 'transporte-pago-destino'));
-            $this->enabled = $this->get_option('enabled', 'yes');
-            $this->transportes = $this->get_option('transportes', array());
-            
-            add_action('woocommerce_update_options_shipping_' . $this->id, array($this, 'process_admin_options'));
+
+            $this->title                = $this->get_option( 'title', 'Elija su método de envío' );
+            $this->cost                 = $this->get_option( 'cost', '0' );
+            $this->free_shipping        = $this->get_option( 'free_shipping', 'no' );
+            $this->carriers             = $this->get_option( 'carriers', '' );
+            $this->allow_custom_carrier = $this->get_option( 'allow_custom_carrier', 'yes' );
+            $this->carrier_field        = $this->get_option( 'carrier_field', 'Transportista personalizado' );
+
+            add_action( 'woocommerce_update_options_shipping_' . $this->id, array( $this, 'process_admin_options' ) );
         }
-        
+
         public function init_form_fields() {
             $this->instance_form_fields = array(
-                'enabled' => array(
-                    'title' => __('Activar/Desactivar', 'transporte-pago-destino'),
-                    'type' => 'checkbox',
-                    'label' => __('Activar este método de envío', 'transporte-pago-destino'),
-                    'default' => 'yes'
-                ),
                 'title' => array(
-                    'title' => __('Título del método', 'transporte-pago-destino'),
+                    'title' => 'Título',
                     'type' => 'text',
-                    'description' => __('Título que verá el cliente en el checkout', 'transporte-pago-destino'),
-                    'default' => __('Transporte Pago en Destino', 'transporte-pago-destino'),
+                    'description' => 'Título del método mostrado al cliente.',
+                    'default' => 'Elija su método de envío',
                     'desc_tip' => true,
                 ),
-                'transportes' => array(
-                    'title' => __('Lista de Transportes', 'transporte-pago-destino'),
-                    'type' => 'transportes_table',
-                    'description' => __('Agregue los transportes disponibles', 'transporte-pago-destino'),
+                'cost' => array(
+                    'title' => 'Costo fijo',
+                    'type' => 'price',
+                    'description' => 'Costo del envío. Puede ser 0.',
+                    'default' => '0',
+                    'desc_tip' => true,
+                ),
+                'free_shipping' => array(
+                    'title' => '¿Es gratis?',
+                    'type' => 'checkbox',
+                    'label' => 'Envío sin costo',
+                    'default' => 'no',
+                ),
+                'carriers' => array(
+                    'title' => 'Opciones de transportistas',
+                    'type' => 'textarea',
+                    'description' => "Enumera las opciones separadas por salto de línea. Ejemplo:\nOCA\nAndreani\nCorreo Argentino",
+                    'default' => '',
+                    'desc_tip' => true,
+                ),
+                'allow_custom_carrier' => array(
+                    'title' => '¿Permitir transportista personalizado?',
+                    'type' => 'checkbox',
+                    'label' => 'El cliente puede ingresar su propia opción de transporte.',
+                    'default' => 'yes',
+                ),
+                'carrier_field' => array(
+                    'title' => 'Texto para opción personalizada',
+                    'type' => 'text',
+                    'description' => 'Texto del campo para "Otro (especifique)".',
+                    'default' => 'Transportista personalizado',
+                    'desc_tip' => true,
                 ),
             );
         }
-        
-        public function generate_transportes_table_html($key, $data) {
-            $field_key = $this->get_field_key($key);
-            $transportes = $this->get_option($key, array());
-            
-            ob_start();
-            ?>
-            <tr valign="top">
-                <th scope="row" class="titledesc">
-                    <label><?php echo esc_html($data['title']); ?></label>
-                </th>
-                <td class="forminp">
-                    <div id="transportes-container">
-                        <table class="widefat" id="transportes-table">
-                            <thead>
-                                <tr>
-                                    <th><?php _e('Nombre del Transporte', 'transporte-pago-destino'); ?></th>
-                                    <th><?php _e('Activo', 'transporte-pago-destino'); ?></th>
-                                    <th><?php _e('Acciones', 'transporte-pago-destino'); ?></th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php 
-                                if (!empty($transportes)) {
-                                    foreach ($transportes as $index => $transporte) {
-                                        ?>
-                                        <tr>
-                                            <td>
-                                                <input type="text" 
-                                                       name="<?php echo esc_attr($field_key); ?>[<?php echo $index; ?>][nombre]" 
-                                                       value="<?php echo esc_attr($transporte['nombre']); ?>" 
-                                                       class="regular-text" />
-                                            </td>
-                                            <td>
-                                                <input type="checkbox" 
-                                                       name="<?php echo esc_attr($field_key); ?>[<?php echo $index; ?>][activo]" 
-                                                       value="1" 
-                                                       <?php checked(isset($transporte['activo']) && $transporte['activo'], true); ?> />
-                                            </td>
-                                            <td>
-                                                <button type="button" class="button remove-transporte"><?php _e('Eliminar', 'transporte-pago-destino'); ?></button>
-                                            </td>
-                                        </tr>
-                                        <?php
-                                    }
-                                }
-                                ?>
-                            </tbody>
-                        </table>
-                        <p>
-                            <button type="button" class="button button-primary" id="add-transporte">
-                                <?php _e('+ Agregar Transporte', 'transporte-pago-destino'); ?>
-                            </button>
-                        </p>
-                    </div>
-                    <script type="text/javascript">
-                        jQuery(document).ready(function($) {
-                            var index = <?php echo !empty($transportes) ? max(array_keys($transportes)) + 1 : 0; ?>;
-                            var fieldKey = '<?php echo esc_js($field_key); ?>';
-                            
-                            $('#add-transporte').on('click', function() {
-                                var row = '<tr>' +
-                                    '<td><input type="text" name="' + fieldKey + '[' + index + '][nombre]" value="" class="regular-text" /></td>' +
-                                    '<td><input type="checkbox" name="' + fieldKey + '[' + index + '][activo]" value="1" checked /></td>' +
-                                    '<td><button type="button" class="button remove-transporte"><?php _e('Eliminar', 'transporte-pago-destino'); ?></button></td>' +
-                                    '</tr>';
-                                $('#transportes-table tbody').append(row);
-                                index++;
-                            });
-                            
-                            $(document).on('click', '.remove-transporte', function() {
-                                $(this).closest('tr').remove();
-                            });
-                        });
-                    </script>
-                </td>
-            </tr>
-            <?php
-            return ob_get_clean();
-        }
-        
-        public function validate_transportes_table_field($key, $value) {
-            $transportes = array();
-            
-            if (is_array($value)) {
-                foreach ($value as $transporte) {
-                    if (!empty($transporte['nombre'])) {
-                        $transportes[] = array(
-                            'nombre' => sanitize_text_field($transporte['nombre']),
-                            'activo' => isset($transporte['activo']) ? true : false,
-                        );
-                    }
+
+        // Append selected carrier from session to the rate label if present
+        public function calculate_shipping( $package = array() ) {
+            $label = $this->title;
+
+            if ( isset( $this->instance_id ) && $this->instance_id ) {
+                $selected = WC()->session->get( 'mobapp_carrier_' . $this->instance_id, '' );
+                $custom   = WC()->session->get( 'mobapp_custom_carrier_' . $this->instance_id, '' );
+
+                if ( $selected === 'custom' && ! empty( $custom ) ) {
+                    $selected_label = sanitize_text_field( $custom );
+                } else {
+                    $selected_label = sanitize_text_field( $selected );
+                }
+
+                if ( ! empty( $selected_label ) ) {
+                    $label = $label . ' - ' . $selected_label;
                 }
             }
-            
-            return $transportes;
-        }
-        
-        public function calculate_shipping($package = array()) {
-            $this->add_rate(array(
-                'id' => $this->get_rate_id(),
-                'label' => $this->title,
-                'cost' => 0,
+
+            $rate = array(
+                'id'    => $this->get_rate_id(),
+                'label' => $label,
+                'cost'  => ($this->free_shipping === 'yes') ? 0 : floatval( $this->cost ),
                 'package' => $package,
-            ));
-        }
-        
-        public function get_transportes_activos() {
-            $transportes = $this->get_option('transportes', array());
-            $activos = array();
-            
-            foreach ($transportes as $transporte) {
-                if (isset($transporte['activo']) && $transporte['activo'] && !empty($transporte['nombre'])) {
-                    $activos[] = $transporte['nombre'];
-                }
-            }
-            
-            return $activos;
+            );
+            $this->add_rate( $rate );
         }
     }
-}
+});
 
-// Registrar el método de envío
-add_filter('woocommerce_shipping_methods', 'add_transporte_pago_destino_method');
-
-function add_transporte_pago_destino_method($methods) {
-    $methods['transporte_pago_destino'] = 'WC_Shipping_Transporte_Pago_Destino';
+add_filter( 'woocommerce_shipping_methods', function( $methods ) {
+    $methods['mobapp_envio_personalizado'] = 'Mobapp_Envio_Personalizado';
     return $methods;
-}
+} );
 
-// Agregar campos en el checkout
-add_action('woocommerce_after_shipping_rate', 'mostrar_selector_transporte', 10, 2);
-
-function mostrar_selector_transporte($method, $index) {
-    if ($method->method_id !== 'transporte_pago_destino') {
+/* --------------------------------------------------------------------
+ * FRONTEND: show selector per instance (data-instance) — session-backed
+ * -------------------------------------------------------------------- */
+add_action( 'woocommerce_after_shipping_rate', 'mobapp_mostrar_campo_transportista', 10, 2 );
+function mobapp_mostrar_campo_transportista( $method, $index ) {
+    if ( $method->get_method_id() !== 'mobapp_envio_personalizado' ) {
         return;
     }
-    
-    // Obtener transportes activos
-    $shipping_methods = WC()->shipping()->get_shipping_methods();
-    $transportes = array();
-    
-    if (isset($shipping_methods['transporte_pago_destino'])) {
-        $zones = WC_Shipping_Zones::get_zones();
-        foreach ($zones as $zone) {
-            foreach ($zone['shipping_methods'] as $shipping_method) {
-                if ($shipping_method->id === 'transporte_pago_destino') {
-                    $transportes = $shipping_method->get_transportes_activos();
-                    break 2;
-                }
-            }
-        }
-        
-        // También revisar la zona "resto del mundo"
-        if (empty($transportes)) {
-            $default_zone = new WC_Shipping_Zone(0);
-            foreach ($default_zone->get_shipping_methods() as $shipping_method) {
-                if ($shipping_method->id === 'transporte_pago_destino') {
-                    $transportes = $shipping_method->get_transportes_activos();
-                    break;
-                }
-            }
+
+    $instance_id = $method->get_instance_id();
+    if ( ! $instance_id ) {
+        return;
+    }
+
+    $shipping_method = new Mobapp_Envio_Personalizado( $instance_id );
+
+    $carriers_raw  = $shipping_method->get_option( 'carriers', '' );
+    $allow_custom  = $shipping_method->get_option( 'allow_custom_carrier', 'yes' );
+    $custom_label  = $shipping_method->get_option( 'carrier_field', 'Transportista personalizado' );
+
+    $carrier_options = array();
+    if ( strlen( trim( $carriers_raw ) ) > 0 ) {
+        $lines = array_map( 'trim', preg_split('/\r\n|\r|\n/', $carriers_raw) );
+        foreach ( $lines as $line ) {
+            if ( $line === '' ) continue;
+            $label = ( preg_match('/^\d+$/', $line) ) ? 'Opción ' . $line : $line;
+            if ( ! in_array( $label, $carrier_options, true ) ) $carrier_options[] = $label;
         }
     }
-    
-    $chosen_transporte = WC()->session->get('transporte_elegido', '');
-    $transporte_otro = WC()->session->get('transporte_otro', '');
-    
-    ?>
-    <div class="transporte-selector" style="margin-top: 15px; padding: 15px; background: #f9f9f9; border-radius: 5px;">
-        <p style="margin-bottom: 10px;"><strong><?php _e('Seleccione su transporte preferido:', 'transporte-pago-destino'); ?></strong></p>
-        
-        <select name="transporte_elegido" id="transporte_elegido" style="width: 100%; margin-bottom: 10px;">
-            <option value=""><?php _e('-- Seleccionar transporte --', 'transporte-pago-destino'); ?></option>
-            <?php foreach ($transportes as $transporte) : ?>
-                <option value="<?php echo esc_attr($transporte); ?>" <?php selected($chosen_transporte, $transporte); ?>>
-                    <?php echo esc_html($transporte); ?>
-                </option>
-            <?php endforeach; ?>
-            <option value="otro" <?php selected($chosen_transporte, 'otro'); ?>><?php _e('Otro (especificar)', 'transporte-pago-destino'); ?></option>
-        </select>
-        
-        <div id="transporte_otro_container" style="display: <?php echo ($chosen_transporte === 'otro') ? 'block' : 'none'; ?>;">
-            <input type="text" 
-                   name="transporte_otro" 
-                   id="transporte_otro" 
-                   value="<?php echo esc_attr($transporte_otro); ?>"
-                   placeholder="<?php _e('Escriba el nombre del transporte', 'transporte-pago-destino'); ?>" 
-                   style="width: 100%;" />
-        </div>
-    </div>
-    
-    <script type="text/javascript">
-        jQuery(document).ready(function($) {
-            $('#transporte_elegido').on('change', function() {
-                if ($(this).val() === 'otro') {
-                    $('#transporte_otro_container').slideDown();
-                } else {
-                    $('#transporte_otro_container').slideUp();
-                }
-                
-                // Guardar en sesión via AJAX
-                $.ajax({
-                    url: wc_checkout_params.ajax_url,
-                    type: 'POST',
-                    data: {
-                        action: 'guardar_transporte_elegido',
-                        transporte: $(this).val(),
-                        transporte_otro: $('#transporte_otro').val(),
-                        security: '<?php echo wp_create_nonce('guardar_transporte_nonce'); ?>'
-                    }
-                });
-            });
-            
-            $('#transporte_otro').on('change', function() {
-                $.ajax({
-                    url: wc_checkout_params.ajax_url,
-                    type: 'POST',
-                    data: {
-                        action: 'guardar_transporte_elegido',
-                        transporte: $('#transporte_elegido').val(),
-                        transporte_otro: $(this).val(),
-                        security: '<?php echo wp_create_nonce('guardar_transporte_nonce'); ?>'
-                    }
-                });
-            });
-        });
-    </script>
-    <?php
-}
 
-// AJAX para guardar transporte en sesión
-add_action('wp_ajax_guardar_transporte_elegido', 'guardar_transporte_elegido');
-add_action('wp_ajax_nopriv_guardar_transporte_elegido', 'guardar_transporte_elegido');
-
-function guardar_transporte_elegido() {
-    check_ajax_referer('guardar_transporte_nonce', 'security');
-    
-    WC()->session->set('transporte_elegido', sanitize_text_field($_POST['transporte']));
-    WC()->session->set('transporte_otro', sanitize_text_field($_POST['transporte_otro']));
-    
-    wp_die();
-}
-
-// Validar que se seleccionó un transporte
-add_action('woocommerce_checkout_process', 'validar_transporte_elegido');
-
-function validar_transporte_elegido() {
-    $chosen_methods = WC()->session->get('chosen_shipping_methods');
-    
-    if (!empty($chosen_methods)) {
-        foreach ($chosen_methods as $method) {
-            if (strpos($method, 'transporte_pago_destino') !== false) {
-                $transporte = WC()->session->get('transporte_elegido', '');
-                
-                if (empty($transporte)) {
-                    wc_add_notice(__('Por favor seleccione un transporte para el envío.', 'transporte-pago-destino'), 'error');
-                }
-                
-                if ($transporte === 'otro') {
-                    $transporte_otro = WC()->session->get('transporte_otro', '');
-                    if (empty($transporte_otro)) {
-                        wc_add_notice(__('Por favor especifique el nombre del transporte.', 'transporte-pago-destino'), 'error');
-                    }
-                }
-            }
-        }
+    if ( empty( $carrier_options ) && $allow_custom !== 'yes' ) {
+        return;
     }
-}
 
-// Guardar transporte en el pedido
-add_action('woocommerce_checkout_create_order', 'guardar_transporte_en_pedido', 10, 2);
+    $selected_carrier = WC()->session->get( 'mobapp_carrier_' . $instance_id, '' );
+    $custom_carrier   = WC()->session->get( 'mobapp_custom_carrier_' . $instance_id, '' );
 
-function guardar_transporte_en_pedido($order, $data) {
-    $transporte = WC()->session->get('transporte_elegido', '');
-    $transporte_otro = WC()->session->get('transporte_otro', '');
-    
-    if (!empty($transporte)) {
-        if ($transporte === 'otro' && !empty($transporte_otro)) {
-            $transporte_final = $transporte_otro . ' (personalizado)';
-        } else {
-            $transporte_final = $transporte;
+    // Output container with data-instance so JS can match it to radio
+    echo '<div class="mobapp-carrier-selector" data-instance="' . esc_attr( $instance_id ) . '" style="margin-top:10px;">';
+
+    if ( ! empty( $carrier_options ) ) {
+        echo '<select name="mobapp_carrier[' . esc_attr( $instance_id ) . ']" class="mobapp-carrier-select" style="width:100%; max-width:100%;">';
+        echo '<option value="">' . esc_html__( 'Seleccione transportista', 'mobapp-transportes' ) . '</option>';
+        foreach ( $carrier_options as $carrier ) {
+            $sel = ( $selected_carrier === $carrier ) ? 'selected' : '';
+            echo '<option value="' . esc_attr( $carrier ) . '" ' . $sel . '>' . esc_html( $carrier ) . '</option>';
         }
-        
-        $order->update_meta_data('_transporte_elegido', $transporte_final);
+        if ( $allow_custom === 'yes' ) {
+            $sel = ( $selected_carrier === 'custom' ) ? 'selected' : '';
+            echo '<option value="custom" ' . $sel . '>' . esc_html__( 'Otro (especifique)', 'mobapp-transportes' ) . '</option>';
+        }
+        echo '</select>';
     }
-    
-    // Limpiar sesión
-    WC()->session->set('transporte_elegido', '');
-    WC()->session->set('transporte_otro', '');
-}
 
-// Mostrar transporte en el admin de pedidos
-add_action('woocommerce_admin_order_data_after_shipping_address', 'mostrar_transporte_admin_pedido');
-
-function mostrar_transporte_admin_pedido($order) {
-    $transporte = $order->get_meta('_transporte_elegido');
-    
-    if (!empty($transporte)) {
-        echo '<div class="address" style="margin-top: 15px; padding: 10px; background: #e7f3ff; border-left: 4px solid #0073aa;">';
-        echo '<p><strong>' . __('Transporte Elegido:', 'transporte-pago-destino') . '</strong><br>';
-        echo '<span style="font-size: 14px; color: #0073aa;">' . esc_html($transporte) . '</span></p>';
+    if ( $allow_custom === 'yes' ) {
+        $display = ( $selected_carrier === 'custom' || empty( $carrier_options ) ) ? 'block' : 'none';
+        echo '<div style="margin-top:6px;">';
+        echo '<input type="text" name="mobapp_custom_carrier[' . esc_attr( $instance_id ) . ']" class="mobapp-custom-carrier" placeholder="' . esc_attr( $custom_label ) . '" value="' . esc_attr( $custom_carrier ) . '" style="width:100%; max-width:100%; display:' . esc_attr( $display ) . ';">';
         echo '</div>';
     }
+
+    echo '</div>';
 }
 
-// Mostrar en la lista de pedidos (columna personalizada)
-add_filter('manage_edit-shop_order_columns', 'agregar_columna_transporte');
-add_filter('manage_woocommerce_page_wc-orders_columns', 'agregar_columna_transporte');
+/* --------------------------------------------------------------------
+ * AJAX handler: save selection in session with server dedupe; ignore empty payloads
+ * -------------------------------------------------------------------- */
+add_action( 'wp_ajax_mobapp_save_carrier', 'mobapp_ajax_save_carrier' );
+add_action( 'wp_ajax_nopriv_mobapp_save_carrier', 'mobapp_ajax_save_carrier' );
+function mobapp_ajax_save_carrier() {
+    $nonce = isset( $_POST['nonce'] ) ? sanitize_text_field( wp_unslash( $_POST['nonce'] ) ) : '';
+    if ( ! wp_verify_nonce( $nonce, 'mobapp-save-carrier' ) ) {
+        wp_send_json_error( array( 'message' => 'Nonce inválido' ), 403 );
+    }
 
-function agregar_columna_transporte($columns) {
-    $new_columns = array();
-    
-    foreach ($columns as $key => $column) {
-        $new_columns[$key] = $column;
-        if ($key === 'shipping_address') {
-            $new_columns['transporte_elegido'] = __('Transporte', 'transporte-pago-destino');
+    $instance_id = isset( $_POST['instance_id'] ) ? absint( $_POST['instance_id'] ) : 0;
+    $carrier     = isset( $_POST['carrier'] ) ? sanitize_text_field( wp_unslash( $_POST['carrier'] ) ) : '';
+    $custom      = isset( $_POST['custom'] ) ? sanitize_text_field( wp_unslash( $_POST['custom'] ) ) : '';
+
+    if ( $instance_id <= 0 ) {
+        wp_send_json_error( array( 'message' => 'Instance ID inválido' ), 400 );
+    }
+
+    // If empty payload (no useful data), respond success but do not write session
+    if ( $carrier === '' && $custom === '' ) {
+        wp_send_json_success( array( 'saved' => false, 'reason' => 'empty' ) );
+    }
+
+    $session_key = 'mobapp_last_save_' . $instance_id;
+    $last = WC()->session->get( $session_key, array( 'hash' => '', 'time' => 0 ) );
+
+    $hash = md5( $instance_id . '|' . $carrier . '|' . $custom );
+    $now = microtime( true );
+    $threshold = 0.8;
+
+    if ( isset( $last['hash'] ) && $last['hash'] === $hash && ( $now - floatval( $last['time'] ) ) < $threshold ) {
+        wp_send_json_success( array( 'saved' => true, 'duplicate' => true ) );
+    }
+
+    if ( $carrier !== '' ) {
+        WC()->session->set( 'mobapp_carrier_' . $instance_id, $carrier );
+    } else {
+        WC()->session->__unset( 'mobapp_carrier_' . $instance_id );
+    }
+
+    if ( $custom !== '' ) {
+        WC()->session->set( 'mobapp_custom_carrier_' . $instance_id, $custom );
+    } else {
+        WC()->session->__unset( 'mobapp_custom_carrier_' . $instance_id );
+    }
+
+    WC()->session->set( $session_key, array( 'hash' => $hash, 'time' => $now ) );
+
+    wp_send_json_success( array( 'saved' => true, 'duplicate' => false ) );
+}
+
+/* --------------------------------------------------------------------
+ * Fallbacks, validation, collect & save into order - same robust flow as before
+ * -------------------------------------------------------------------- */
+add_action( 'woocommerce_cart_updated', 'mobapp_guardar_carrier_session' );
+add_action( 'woocommerce_checkout_update_order_review', 'mobapp_guardar_carrier_session' );
+function mobapp_guardar_carrier_session() {
+    if ( ! empty( $_POST['mobapp_carrier'] ) && is_array( $_POST['mobapp_carrier'] ) ) {
+        foreach ( $_POST['mobapp_carrier'] as $instance_id => $carrier ) {
+            $iid = absint( $instance_id );
+            WC()->session->set( 'mobapp_carrier_' . $iid, sanitize_text_field( wp_unslash( $carrier ) ) );
         }
     }
-    
-    return $new_columns;
-}
-
-add_action('manage_shop_order_posts_custom_column', 'mostrar_columna_transporte', 10, 2);
-add_action('manage_woocommerce_page_wc-orders_custom_column', 'mostrar_columna_transporte_hpos', 10, 2);
-
-function mostrar_columna_transporte($column, $post_id) {
-    if ($column === 'transporte_elegido') {
-        $order = wc_get_order($post_id);
-        $transporte = $order->get_meta('_transporte_elegido');
-        echo !empty($transporte) ? esc_html($transporte) : '—';
+    if ( ! empty( $_POST['mobapp_custom_carrier'] ) && is_array( $_POST['mobapp_custom_carrier'] ) ) {
+        foreach ( $_POST['mobapp_custom_carrier'] as $instance_id => $custom ) {
+            $iid = absint( $instance_id );
+            WC()->session->set( 'mobapp_custom_carrier_' . $iid, sanitize_text_field( wp_unslash( $custom ) ) );
+        }
     }
 }
 
-function mostrar_columna_transporte_hpos($column, $order) {
-    if ($column === 'transporte_elegido') {
-        $transporte = $order->get_meta('_transporte_elegido');
-        echo !empty($transporte) ? esc_html($transporte) : '—';
+add_action( 'woocommerce_checkout_process', 'mobapp_validar_carrier' );
+function mobapp_validar_carrier() {
+    $chosen_methods = WC()->session->get( 'chosen_shipping_methods', array() );
+    if ( empty( $chosen_methods ) || ! is_array( $chosen_methods ) ) return;
+    foreach ( $chosen_methods as $chosen ) {
+        if ( strpos( $chosen, 'mobapp_envio_personalizado' ) === 0 ) {
+            $parts = explode( ':', $chosen );
+            $instance_id = isset( $parts[1] ) ? absint( $parts[1] ) : 0;
+            if ( $instance_id <= 0 ) continue;
+            $carrier = isset( $_POST['mobapp_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_carrier_' . $instance_id, '' );
+            $custom  = isset( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_custom_carrier_' . $instance_id, '' );
+            if ( empty( $carrier ) && empty( $custom ) ) {
+                wc_add_notice( __( 'Por favor seleccione o ingrese un transportista.' , 'mobapp-transportes' ), 'error' );
+            }
+            if ( $carrier === 'custom' && empty( $custom ) ) {
+                wc_add_notice( __( 'Por favor especifique el transportista personalizado.' , 'mobapp-transportes' ), 'error' );
+            }
+        }
     }
 }
 
-// Agregar transporte a los emails
-add_action('woocommerce_email_after_order_table', 'agregar_transporte_email', 10, 4);
+/* Helper: collect selected carriers (prefer POST, fallback session) */
+function mobapp_collect_selected_carriers() {
+    $saved = array();
+    $chosen_methods = WC()->session->get( 'chosen_shipping_methods', array() );
+    $get_instance_labels = function( $iid ) {
+        $shipping_method = new Mobapp_Envio_Personalizado( $iid );
+        $carriers_raw = $shipping_method->get_option( 'carriers', '' );
+        if ( strlen( trim( $carriers_raw ) ) === 0 ) return array();
+        $lines = array_map( 'trim', preg_split('/\r\n|\r|\n/', $carriers_raw) );
+        $labels = array();
+        foreach ( $lines as $line ) {
+            if ( $line === '' ) continue;
+            $labels[] = ( preg_match('/^\d+$/', $line) ) ? 'Opción ' . $line : $line;
+        }
+        return array_values( array_unique( $labels ) );
+    };
 
-function agregar_transporte_email($order, $sent_to_admin, $plain_text, $email) {
-    $transporte = $order->get_meta('_transporte_elegido');
-    
-    if (empty($transporte)) {
+    if ( empty( $chosen_methods ) || ! is_array( $chosen_methods ) ) {
+        if ( ! empty( $_POST['mobapp_carrier'] ) && is_array( $_POST['mobapp_carrier'] ) ) {
+            foreach ( $_POST['mobapp_carrier'] as $instance_id => $carrier ) {
+                $iid = absint( $instance_id );
+                $carrier_final = sanitize_text_field( wp_unslash( $carrier ) );
+                if ( $carrier_final === 'custom' && ! empty( $_POST['mobapp_custom_carrier'][ $iid ] ) ) {
+                    $carrier_final = sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $iid ] ) );
+                }
+                if ( is_numeric( $carrier_final ) ) {
+                    $labels = $get_instance_labels( $iid );
+                    $idx = intval( $carrier_final );
+                    if ( isset( $labels[ $idx ] ) ) $carrier_final = $labels[ $idx ];
+                }
+                if ( $carrier_final !== '' ) $saved[ $iid ] = $carrier_final;
+            }
+        } else {
+            if ( is_object( WC()->session ) && method_exists( WC()->session, '__get_session' ) ) {
+                $session_all = WC()->session->__get_session();
+                foreach ( $session_all as $k => $v ) {
+                    if ( strpos( $k, 'mobapp_carrier_' ) === 0 ) {
+                        $iid = intval( str_replace( 'mobapp_carrier_', '', $k ) );
+                        if ( $iid > 0 ) {
+                            $val = WC()->session->get( $k, '' );
+                            if ( $val !== '' ) $saved[ $iid ] = sanitize_text_field( $val );
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        foreach ( $chosen_methods as $chosen ) {
+            if ( strpos( $chosen, 'mobapp_envio_personalizado' ) === 0 ) {
+                $parts = explode( ':', $chosen );
+                $instance_id = isset( $parts[1] ) ? absint( $parts[1] ) : 0;
+                if ( $instance_id <= 0 ) continue;
+                $carrier = isset( $_POST['mobapp_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_carrier_' . $instance_id, '' );
+                if ( $carrier === 'custom' ) {
+                    $carrier = isset( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_custom_carrier_' . $instance_id, '' );
+                }
+                if ( is_numeric( $carrier ) ) {
+                    $labels = $get_instance_labels( $instance_id );
+                    $idx = intval( $carrier );
+                    if ( isset( $labels[ $idx ] ) ) $carrier = $labels[ $idx ];
+                }
+                if ( $carrier !== '' ) $saved[ $instance_id ] = $carrier;
+            }
+        }
+    }
+
+    return $saved;
+}
+
+/* Save carriers to order (meta + update shipping item titles idempotently) */
+function mobapp_save_carriers_to_order( $order_id, $saved ) {
+    if ( empty( $saved ) || ! $order_id ) return;
+
+    update_post_meta( $order_id, '_mobapp_transportistas', $saved );
+    foreach ( $saved as $iid => $carrier_name ) {
+        update_post_meta( $order_id, '_mobapp_transportista_' . $iid, $carrier_name );
+        $shipping_method = new Mobapp_Envio_Personalizado( $iid );
+        $method_title = $shipping_method ? $shipping_method->get_option( 'title', '' ) : '';
+        if ( $method_title ) {
+            update_post_meta( $order_id, '_mobapp_method_title_' . $iid, sanitize_text_field( $method_title ) );
+        }
+    }
+
+    // Update shipping item titles idempotently
+    $order = wc_get_order( $order_id );
+    if ( $order ) {
+        $shipping_items = $order->get_items( 'shipping' );
+        foreach ( $shipping_items as $item_id => $shipping_item ) {
+            $item_instance = 0;
+            if ( method_exists( $shipping_item, 'get_instance_id' ) ) {
+                $item_instance = (int) $shipping_item->get_instance_id();
+            } else {
+                $method_id = $shipping_item->get_method_id();
+                if ( strpos( $method_id, ':' ) !== false ) {
+                    $parts = explode( ':', $method_id );
+                    $item_instance = isset( $parts[1] ) ? absint( $parts[1] ) : 0;
+                }
+            }
+
+            if ( $item_instance && isset( $saved[ $item_instance ] ) ) {
+                $selection = $saved[ $item_instance ];
+                $current_title = (string) $shipping_item->get_method_title();
+                $suffix = ' - ' . $selection;
+                if ( strpos( $current_title, $suffix ) === false ) {
+                    $pattern = '/' . preg_quote($suffix, '/') . '(?:\s*' . preg_quote($suffix, '/') . ')*$/u';
+                    $normalized = preg_replace( $pattern, $suffix, $current_title );
+                    if ( $normalized === null ) $normalized = rtrim( $current_title );
+                    $new_title = rtrim( $normalized ) . $suffix;
+                    $shipping_item->set_method_title( $new_title );
+                    $shipping_item->save();
+                }
+            }
+        }
+        $order->save();
+    }
+}
+
+/* Hook into order creation and other flows */
+add_action( 'woocommerce_checkout_create_order', 'mobapp_checkout_create_order_save', 20, 2 );
+function mobapp_checkout_create_order_save( $order, $data ) {
+    $saved = mobapp_collect_selected_carriers();
+    if ( ! empty( $saved ) ) {
+        mobapp_save_carriers_to_order( $order->get_id(), $saved );
+    }
+}
+
+add_action( 'woocommerce_checkout_order_processed', 'mobapp_checkout_order_processed_save', 20, 2 );
+function mobapp_checkout_order_processed_save( $order_id, $posted_data ) {
+    if ( ! $order_id ) {
         return;
     }
-    
-    if ($plain_text) {
-        echo "\n" . __('Transporte Elegido:', 'transporte-pago-destino') . ' ' . $transporte . "\n";
-    } else {
-        ?>
-        <div style="margin: 20px 0; padding: 15px; background-color: #f8f8f8; border-left: 4px solid #0073aa;">
-            <h3 style="margin: 0 0 10px 0; color: #0073aa;"><?php _e('Información de Transporte', 'transporte-pago-destino'); ?></h3>
-            <p style="margin: 0;">
-                <strong><?php _e('Transporte Elegido:', 'transporte-pago-destino'); ?></strong> 
-                <?php echo esc_html($transporte); ?>
-            </p>
-        </div>
-        <?php
+    $existing = get_post_meta( $order_id, '_mobapp_transportistas', true );
+    if ( ! empty( $existing ) ) {
+        return;
+    }
+    $saved = mobapp_collect_selected_carriers();
+    if ( ! empty( $saved ) ) {
+        mobapp_save_carriers_to_order( $order_id, $saved );
     }
 }
 
-// Mostrar en detalles del pedido (cliente)
-add_action('woocommerce_order_details_after_order_table', 'mostrar_transporte_detalles_pedido');
-
-function mostrar_transporte_detalles_pedido($order) {
-    $transporte = $order->get_meta('_transporte_elegido');
-    
-    if (!empty($transporte)) {
-        ?>
-        <section class="woocommerce-transporte-details">
-            <h2><?php _e('Información de Transporte', 'transporte-pago-destino'); ?></h2>
-            <table class="woocommerce-table woocommerce-table--transporte-details">
-                <tbody>
-                    <tr>
-                        <th><?php _e('Transporte Elegido:', 'transporte-pago-destino'); ?></th>
-                        <td><?php echo esc_html($transporte); ?></td>
-                    </tr>
-                </tbody>
-            </table>
-        </section>
-        <?php
+add_action( 'woocommerce_thankyou', 'mobapp_thankyou_final_save', 20 );
+function mobapp_thankyou_final_save( $order_id ) {
+    if ( ! $order_id ) {
+        return;
+    }
+    $existing = get_post_meta( $order_id, '_mobapp_transportistas', true );
+    if ( ! empty( $existing ) ) {
+        return;
+    }
+    $saved = mobapp_collect_selected_carriers();
+    if ( ! empty( $saved ) ) {
+        mobapp_save_carriers_to_order( $order_id, $saved );
     }
 }
+
+/* --------------------------------------------------------------------
+ * Admin / order details / email display (if not already defined above)
+ * These are idempotent checks so they can be safely included even if
+ * the functions exist earlier in the file.
+ * -------------------------------------------------------------------- */
+if ( ! function_exists( 'mobapp_mostrar_carrier_admin_fixed' ) ) {
+    add_action( 'woocommerce_admin_order_data_after_shipping_address', 'mobapp_mostrar_carrier_admin_fixed', 11, 1 );
+    function mobapp_mostrar_carrier_admin_fixed( $order ) {
+        $saved = $order->get_meta( '_mobapp_transportistas', true );
+        if ( is_array( $saved ) && ! empty( $saved ) ) {
+            echo '<div class="mobapp-transportistas-admin" style="margin-top:10px;"><h4>' . esc_html__( 'Transportistas (Mobapp)', 'mobapp-transportes' ) . '</h4>';
+            foreach ( $saved as $iid => $carrier ) {
+                $method_title = $order->get_meta( '_mobapp_method_title_' . $iid, true );
+                if ( ! $method_title ) {
+                    $sm = new Mobapp_Envio_Personalizado( $iid );
+                    $method_title = $sm ? $sm->get_option( 'title', '' ) : '';
+                }
+                $label = $method_title ? sprintf( '%s (instancia %d)', esc_html( $method_title ), intval( $iid ) ) : sprintf( 'Instancia %d', intval( $iid ) );
+                echo '<p><strong>' . esc_html( $label ) . ':</strong> ' . esc_html( $carrier ) . '</p>';
+            }
+            echo '</div>';
+        }
+    }
+}
+
+if ( ! function_exists( 'mobapp_mostrar_carrier_order_details_fixed' ) ) {
+    add_action( 'woocommerce_order_details_after_order_table', 'mobapp_mostrar_carrier_order_details_fixed', 11, 1 );
+    function mobapp_mostrar_carrier_order_details_fixed( $order ) {
+        $saved = $order->get_meta( '_mobapp_transportistas', true );
+        if ( is_array( $saved ) && ! empty( $saved ) ) {
+            echo '<section class="woocommerce-order-carrier" style="margin-top:1em;"><h2>' . esc_html__( 'Información de transporte', 'mobapp-transportes' ) . '</h2>';
+            foreach ( $saved as $iid => $carrier ) {
+                $method_title = $order->get_meta( '_mobapp_method_title_' . $iid, true );
+                if ( ! $method_title ) {
+                    $sm = new Mobapp_Envio_Personalizado( $iid );
+                    $method_title = $sm ? $sm->get_option( 'title', '' ) : '';
+                }
+                $label = $method_title ? sprintf( '%s (instancia %d)', esc_html( $method_title ), intval( $iid ) ) : sprintf( 'Instancia %d', intval( $iid ) );
+                echo '<p><strong>' . esc_html( $label ) . ':</strong> ' . esc_html( $carrier ) . '</p>';
+            }
+            echo '</section>';
+        }
+    }
+}
+
+if ( ! function_exists( 'mobapp_mostrar_carrier_email' ) ) {
+    add_action( 'woocommerce_email_after_order_table', 'mobapp_mostrar_carrier_email', 10, 4 );
+    function mobapp_mostrar_carrier_email( $order, $sent_to_admin, $plain_text = false, $email = null ) {
+        if ( ! is_a( $order, 'WC_Order' ) ) {
+            $order = wc_get_order( $order );
+        }
+        $saved = $order ? $order->get_meta( '_mobapp_transportistas', true ) : array();
+        if ( is_array( $saved ) && ! empty( $saved ) ) {
+            if ( $plain_text ) {
+                echo "\nTransportistas:\n";
+                foreach ( $saved as $iid => $carrier ) {
+                    $method_title = $order->get_meta( '_mobapp_method_title_' . $iid, true );
+                    $label = $method_title ? sprintf( '%s (instancia %d)', $method_title, intval( $iid ) ) : sprintf( 'Instancia %d', intval( $iid ) );
+                    echo sprintf( ' - %s: %s', $label, $carrier ) . "\n";
+                }
+                echo "\n";
+            } else {
+                echo '<div class="mobapp-transportistas-email" style="margin-top:1em;">';
+                echo '<h3>' . esc_html__( 'Transportistas seleccionados', 'mobapp-transportes' ) . '</h3>';
+                foreach ( $saved as $iid => $carrier ) {
+                    $method_title = $order->get_meta( '_mobapp_method_title_' . $iid, true );
+                    $label = $method_title ? sprintf( '%s (instancia %d)', esc_html( $method_title ), intval( $iid ) ) : sprintf( 'Instancia %d', intval( $iid ) );
+                    echo '<p><strong>' . esc_html( $label ) . ':</strong> ' . esc_html( $carrier ) . '</p>';
+                }
+                echo '</div>';
+            }
+        }
+    }
+}
+
+if ( ! function_exists( 'mobapp_add_meta_to_email_fixed' ) ) {
+    add_filter( 'woocommerce_email_order_meta_fields', 'mobapp_add_meta_to_email_fixed', 11, 3 );
+    function mobapp_add_meta_to_email_fixed( $fields, $sent_to_admin, $order ) {
+        $saved = $order ? $order->get_meta( '_mobapp_transportistas', true ) : array();
+        if ( is_array( $saved ) && ! empty( $saved ) ) {
+            $i = 1;
+            foreach ( $saved as $iid => $carrier ) {
+                $method_title = $order->get_meta( '_mobapp_method_title_' . $iid, true );
+                if ( ! $method_title ) {
+                    $sm = new Mobapp_Envio_Personalizado( $iid );
+                    $method_title = $sm ? $sm->get_option( 'title', '' ) : '';
+                }
+                $label = $method_title ? sprintf( __( 'Transportista (%s)', 'mobapp-transportes' ), $method_title ) : sprintf( __( 'Transportista (instancia %d)', 'mobapp-transportes' ), intval( $iid ) );
+                $fields['mobapp_carrier_' . $i] = array(
+                    'label' => $label,
+                    'value' => esc_html( $carrier ),
+                );
+                $i++;
+            }
+        }
+        return $fields;
+    }
+}
+
+// EOF
