@@ -1,8 +1,8 @@
 <?php
 /*
-Plugin Name: Mobapp Transportes Personalizados
+Plugin Name: MOBAPP LOGISTICA INTELIGENTE TRANSPORTES Y MICROS PERSONALIZADO
 Description: Método de envío para WooCommerce con selección de transportista o personalizado. Guarda la selección por instancia (AJAX + sesión + dedupe), muestra solo el desplegable del método seleccionado y ocupa todo el ancho. Todo ejecutado desde el plugin.
-Version: 2.9
+Version: 3.0
 Author: Mobapp Express
 License: GPL2
 Domain Path: /languages
@@ -25,7 +25,7 @@ function mobapp_enqueue_scripts() {
     }
 
     // Register a no-file script handle and enqueue inline JS
-    wp_register_script( 'mobapp-transportes', false, array( 'jquery' ), '2.9', true );
+    wp_register_script( 'mobapp-transportes', false, array( 'jquery' ), '3.0', true );
     wp_enqueue_script( 'mobapp-transportes' );
 
     // Localize for AJAX
@@ -47,7 +47,7 @@ function mobapp_enqueue_scripts() {
         var state = ensureState(iid);
         var hash = payloadHash(iid, carrier, custom);
 
-        // Don't send if there's nothing useful to save
+        // Don't send if there's nothing useful to save - MODIFIED: allow saving if custom has value even if carrier is empty
         if ((carrier === '' || typeof carrier === 'undefined') && (custom === '' || typeof custom === 'undefined')) {
             return;
         }
@@ -86,7 +86,7 @@ function mobapp_enqueue_scripts() {
         var iid = $container.data('instance');
         var val = $(this).val() || '';
         var custom = $container.find('.mobapp-custom-carrier').val() || '';
-        if (val === 'custom') $container.find('.mobapp-custom-carrier').show(); else $container.find('.mobapp-custom-carrier').hide();
+        // No ocultar el campo custom - siempre visible
         scheduleSave(iid, val, custom);
     });
 
@@ -287,7 +287,8 @@ add_action( 'woocommerce_shipping_init', function() {
                 $selected = WC()->session->get( 'mobapp_carrier_' . $this->instance_id, '' );
                 $custom   = WC()->session->get( 'mobapp_custom_carrier_' . $this->instance_id, '' );
 
-                if ( $selected === 'custom' && ! empty( $custom ) ) {
+                // MODIFICADO: Si selected es 'custom' O está vacío, usar el valor de custom si existe
+                if ( ( $selected === 'custom' || $selected === '' ) && ! empty( $custom ) ) {
                     $selected_label = sanitize_text_field( $custom );
                 } else {
                     $selected_label = sanitize_text_field( $selected );
@@ -369,9 +370,9 @@ function mobapp_mostrar_campo_transportista( $method, $index ) {
     }
 
     if ( $allow_custom === 'yes' ) {
-        $display = ( $selected_carrier === 'custom' || empty( $carrier_options ) ) ? 'block' : 'none';
+        // MODIFICADO: Campo siempre visible (display: block)
         echo '<div style="margin-top:6px;">';
-        echo '<input type="text" name="mobapp_custom_carrier[' . esc_attr( $instance_id ) . ']" class="mobapp-custom-carrier" placeholder="' . esc_attr( $custom_label ) . '" value="' . esc_attr( $custom_carrier ) . '" style="width:100%; max-width:100%; display:' . esc_attr( $display ) . ';">';
+        echo '<input type="text" name="mobapp_custom_carrier[' . esc_attr( $instance_id ) . ']" class="mobapp-custom-carrier" placeholder="' . esc_attr( $custom_label ) . '" value="' . esc_attr( $custom_carrier ) . '" style="width:100%; max-width:100%; display:block;">';
         echo '</div>';
     }
 
@@ -397,7 +398,7 @@ function mobapp_ajax_save_carrier() {
         wp_send_json_error( array( 'message' => 'Instance ID inválido' ), 400 );
     }
 
-    // If empty payload (no useful data), respond success but do not write session
+    // MODIFICADO: Permitir guardar si custom tiene valor aunque carrier esté vacío
     if ( $carrier === '' && $custom === '' ) {
         wp_send_json_success( array( 'saved' => false, 'reason' => 'empty' ) );
     }
@@ -413,12 +414,14 @@ function mobapp_ajax_save_carrier() {
         wp_send_json_success( array( 'saved' => true, 'duplicate' => true ) );
     }
 
+    // Guardar carrier (puede estar vacío)
     if ( $carrier !== '' ) {
         WC()->session->set( 'mobapp_carrier_' . $instance_id, $carrier );
     } else {
         WC()->session->__unset( 'mobapp_carrier_' . $instance_id );
     }
 
+    // Guardar custom (siempre si tiene valor)
     if ( $custom !== '' ) {
         WC()->session->set( 'mobapp_custom_carrier_' . $instance_id, $custom );
     } else {
@@ -459,11 +462,15 @@ function mobapp_validar_carrier() {
             $parts = explode( ':', $chosen );
             $instance_id = isset( $parts[1] ) ? absint( $parts[1] ) : 0;
             if ( $instance_id <= 0 ) continue;
+            
             $carrier = isset( $_POST['mobapp_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_carrier_' . $instance_id, '' );
             $custom  = isset( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_custom_carrier_' . $instance_id, '' );
+            
+            // MODIFICADO: Validar que haya algo seleccionado O escrito en el campo personalizado
             if ( empty( $carrier ) && empty( $custom ) ) {
                 wc_add_notice( __( 'Por favor seleccione o ingrese un transportista.' , 'mobapp-transportes' ), 'error' );
             }
+            // Solo mostrar error de custom vacío si explícitamente eligió "custom" pero no escribió nada
             if ( $carrier === 'custom' && empty( $custom ) ) {
                 wc_add_notice( __( 'Por favor especifique el transportista personalizado.' , 'mobapp-transportes' ), 'error' );
             }
@@ -493,9 +500,14 @@ function mobapp_collect_selected_carriers() {
             foreach ( $_POST['mobapp_carrier'] as $instance_id => $carrier ) {
                 $iid = absint( $instance_id );
                 $carrier_final = sanitize_text_field( wp_unslash( $carrier ) );
-                if ( $carrier_final === 'custom' && ! empty( $_POST['mobapp_custom_carrier'][ $iid ] ) ) {
-                    $carrier_final = sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $iid ] ) );
+                
+                // MODIFICADO: Si carrier es 'custom' O está vacío, revisar el campo personalizado
+                if ( $carrier_final === 'custom' || $carrier_final === '' ) {
+                    if ( ! empty( $_POST['mobapp_custom_carrier'][ $iid ] ) ) {
+                        $carrier_final = sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $iid ] ) );
+                    }
                 }
+                
                 if ( is_numeric( $carrier_final ) ) {
                     $labels = $get_instance_labels( $iid );
                     $idx = intval( $carrier_final );
@@ -511,6 +523,21 @@ function mobapp_collect_selected_carriers() {
                         $iid = intval( str_replace( 'mobapp_carrier_', '', $k ) );
                         if ( $iid > 0 ) {
                             $val = WC()->session->get( $k, '' );
+                            // MODIFICADO: Si val es 'custom' o vacío, buscar en custom_carrier
+                            if ( $val === 'custom' || $val === '' ) {
+                                $custom_val = WC()->session->get( 'mobapp_custom_carrier_' . $iid, '' );
+                                if ( ! empty( $custom_val ) ) {
+                                    $val = $custom_val;
+                                }
+                            }
+                            if ( $val !== '' ) $saved[ $iid ] = sanitize_text_field( $val );
+                        }
+                    }
+                    // MODIFICADO: También revisar directamente los campos custom_carrier
+                    if ( strpos( $k, 'mobapp_custom_carrier_' ) === 0 ) {
+                        $iid = intval( str_replace( 'mobapp_custom_carrier_', '', $k ) );
+                        if ( $iid > 0 && ! isset( $saved[ $iid ] ) ) {
+                            $val = WC()->session->get( $k, '' );
                             if ( $val !== '' ) $saved[ $iid ] = sanitize_text_field( $val );
                         }
                     }
@@ -523,10 +550,17 @@ function mobapp_collect_selected_carriers() {
                 $parts = explode( ':', $chosen );
                 $instance_id = isset( $parts[1] ) ? absint( $parts[1] ) : 0;
                 if ( $instance_id <= 0 ) continue;
+                
                 $carrier = isset( $_POST['mobapp_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_carrier_' . $instance_id, '' );
-                if ( $carrier === 'custom' ) {
-                    $carrier = isset( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_custom_carrier_' . $instance_id, '' );
+                
+                // MODIFICADO: Si carrier es 'custom' O está vacío, buscar en custom_carrier
+                if ( $carrier === 'custom' || $carrier === '' ) {
+                    $custom = isset( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ? sanitize_text_field( wp_unslash( $_POST['mobapp_custom_carrier'][ $instance_id ] ) ) : WC()->session->get( 'mobapp_custom_carrier_' . $instance_id, '' );
+                    if ( ! empty( $custom ) ) {
+                        $carrier = $custom;
+                    }
                 }
+                
                 if ( is_numeric( $carrier ) ) {
                     $labels = $get_instance_labels( $instance_id );
                     $idx = intval( $carrier );
